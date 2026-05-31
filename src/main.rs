@@ -1,6 +1,4 @@
-mod glass;
-mod search;
-mod zim;
+use zxr::{glass, search, zim};
 
 use std::env;
 use std::time::Instant;
@@ -15,6 +13,8 @@ fn main() -> std::io::Result<()> {
     //   zxr [--zim PATH] --info
     let mut zim_path = DEFAULT_ZIM.to_string();
     let mut info_only = false;
+    let mut extract_title: Option<String> = None;
+    let mut out_dir = "wiki-extract".to_string();
     let mut query_parts: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -26,6 +26,20 @@ fn main() -> std::io::Result<()> {
                 }
             }
             "--info" => info_only = true,
+            // `--extract <Title> [--out DIR]`: dump one article's HTML + its
+            // referenced CSS to DIR (default ./wiki-extract), rewriting the
+            // stylesheet hrefs to the local files. A self-contained offline
+            // sample for testing an HTML/CSS renderer.
+            "--extract" => {
+                i += 1;
+                extract_title = args.get(i).cloned();
+            }
+            "--out" => {
+                i += 1;
+                if i < args.len() {
+                    out_dir = args[i].clone();
+                }
+            }
             "--dump-term" => {
                 i += 1;
                 let term = args.get(i).cloned().unwrap_or_default();
@@ -35,6 +49,11 @@ fn main() -> std::io::Result<()> {
         }
         i += 1;
     }
+
+    if let Some(title) = extract_title {
+        return cmd_extract(&zim_path, &title, &out_dir);
+    }
+
     let query = query_parts.join(" ");
 
     let t0 = Instant::now();
@@ -103,6 +122,131 @@ fn dump_term(zim_path: &str, term: &str) -> std::io::Result<()> {
         print!("{out}");
     }
     Ok(())
+}
+
+/// Extract one article's HTML + its referenced CSS into `out_dir`, rewriting
+/// the `<link rel=stylesheet>` hrefs to the local files. A self-contained
+/// offline sample for testing an HTML/CSS renderer.
+fn cmd_extract(zim_path: &str, title: &str, out_dir: &str) -> std::io::Result<()> {
+    use std::fs;
+    use std::path::Path;
+
+    let z = zim::Zim::open(zim_path)?;
+
+    // Resolve the title → content url via the title index (exact match
+    // preferred, else the first prefix hit).
+    let hits = z.title_search(title, 50);
+    let url = hits
+        .iter()
+        .find(|(t, _)| t.eq_ignore_ascii_case(title))
+        .or_else(|| hits.first())
+        .map(|(_, u)| u.clone())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no article matching '{title}'"),
+            )
+        })?;
+
+    let html_bytes = z
+        .article_by_url(b'C', &url)
+        .or_else(|| z.article_by_url(b'A', &url))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("article not found: {url}"),
+            )
+        })?;
+    let mut html = String::from_utf8_lossy(&html_bytes).into_owned();
+
+    let out = Path::new(out_dir);
+    fs::create_dir_all(out)?;
+
+    // Pull each referenced stylesheet out of the archive, write it locally,
+    // and rewrite its href in the HTML to point at the local file.
+    let mut css_n = 0;
+    for href in stylesheet_hrefs(&html) {
+        let (ns, entry) = resolve_href(&href);
+        if let Some((bytes, _mime)) = fetch_entry(&z, ns, &entry) {
+            let fname = format!("style-{css_n}.css");
+            fs::write(out.join(&fname), &bytes)?;
+            html = html.replace(&href, &fname);
+            eprintln!("  css: {fname}  ({} B)  <- {href}", bytes.len());
+            css_n += 1;
+        } else {
+            eprintln!("  css: UNRESOLVED  <- {href}");
+        }
+    }
+
+    fs::write(out.join("article.html"), html.as_bytes())?;
+    eprintln!(
+        "wrote {out_dir}/article.html ({} B) + {css_n} stylesheet(s)  [article url: {url}]",
+        html.len()
+    );
+    Ok(())
+}
+
+/// `href` of every `<link ... rel="stylesheet" ...>` in the HTML (crude tag
+/// scan — fine for the well-formed markup ZIM articles carry).
+fn stylesheet_hrefs(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<link") {
+        let start = pos + rel;
+        let end = lower[start..].find('>').map_or(html.len(), |e| start + e);
+        if lower[start..end].contains("stylesheet")
+            && let Some(h) = attr_value(&html[start..end], "href")
+        {
+            out.push(h);
+        }
+        pos = end;
+    }
+    out
+}
+
+/// Pull a quoted (or bare) attribute value out of a start tag.
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let key = format!("{attr}=");
+    let at = lower.find(&key)? + key.len();
+    let rest = &tag[at..];
+    match rest.chars().next()? {
+        q @ ('"' | '\'') => {
+            let body = &rest[1..];
+            body.find(q).map(|e| body[..e].to_string())
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(rest.len());
+            Some(rest[..end].to_string())
+        }
+    }
+}
+
+/// Resolve a relative ZIM href (`../-/style.css`, `./_mw_/x.css`, …) into a
+/// `(namespace, entry-url)` pair. A leading `../<NS>/` names the ZIM
+/// namespace; everything else defaults to content (`C`).
+fn resolve_href(href: &str) -> (u8, String) {
+    let h = href.split(['#', '?']).next().unwrap_or(href).trim();
+    if let Some(rest) = h.strip_prefix("../") {
+        if let Some((ns, entry)) = rest.split_once('/')
+            && ns.len() == 1
+        {
+            return (ns.as_bytes()[0], entry.to_string());
+        }
+        return (b'C', rest.to_string());
+    }
+    (b'C', h.trim_start_matches("./").trim_start_matches('/').to_string())
+}
+
+/// Fetch an entry, trying the resolved namespace then the common ZIM
+/// namespaces so both legacy (`A`/`-`/`I`) and modern (`C`/`M`) archives work.
+fn fetch_entry(z: &zim::Zim, ns: u8, url: &str) -> Option<(Vec<u8>, String)> {
+    [ns, b'C', b'-', b'I', b'M', b'A']
+        .into_iter()
+        .find_map(|n| z.get_by_url(n, url))
 }
 
 fn print_info(z: &zim::Zim, loc: &zim::BlobLocation, v: &glass::Version) {

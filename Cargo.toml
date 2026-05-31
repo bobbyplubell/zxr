@@ -9,5 +9,5 @@ flate2 = "1.0"      # zlib for glass compressed tags
 zstd = "0.13"       # ZIM cluster decompression (type 5)
 rust-stemmers = "1.2"  # Snowball English stemmer (matches the index's Porter2 stemming)
 
-[profile.release]
-opt-level = 3
+[dev-dependencies]
+tempfile = "3"

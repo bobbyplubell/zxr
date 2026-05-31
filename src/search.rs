@@ -129,6 +129,6 @@ impl<'a> Searcher<'a> {
 fn tokenize(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }

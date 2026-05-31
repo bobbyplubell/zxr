@@ -312,7 +312,7 @@ pub struct Table<'a> {
 }
 
 impl<'a> Table<'a> {
-    pub fn new(file: &'a [u8], base: usize, info: &RootInfo, name: &'static str) -> Table<'a> {
+    pub const fn new(file: &'a [u8], base: usize, info: &RootInfo, name: &'static str) -> Table<'a> {
         Table {
             file,
             base,
